@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -82,11 +82,31 @@ struct Spare(ID3D12Resource, usize);
 // spare.
 unsafe impl Send for Spare {}
 
-/// Spare staging buffers by size (a power of two), and their bytes in all.
-static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
-    Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Without an override, keep the fork's 256 MiB pool of power-of-two
+/// classes through 8 MiB. `VICTORY_STAGING_POOL_MB` opts into quarter-octave
+/// classes up to its byte budget, and `VICTORY_STAGING_POOL=0|alt` still controls reuse.
+static STAGING_POOL_BYTES: LazyLock<Option<u64>> = LazyLock::new(|| {
+    if std::env::var_os("VICTORY_STAGING_POOL").is_some_and(|v| v == "0") {
+        return Some(0);
+    }
+    std::env::var("VICTORY_STAGING_POOL_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|mb| mb.checked_mul(1 << 20))
+});
+static SPARE: LazyLock<Mutex<crate::upload_pool::Pool<Spare>>> =
+    LazyLock::new(|| Mutex::new(crate::upload_pool::Pool::new(STAGING_POOL_BYTES.unwrap_or(256 << 20))));
+
+fn staging_class(total: u64, budget: Option<u64>) -> Option<u64> {
+    if let Some(limit) = budget {
+        let size = crate::upload_pool::class(total);
+        (size <= limit).then_some(size)
+    } else {
+        let size = total.max(64 << 10).checked_next_power_of_two()?;
+        (size <= 8 << 20).then_some(size)
+    }
+}
+
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -105,23 +125,16 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// `VICTORY_STAGING_POOL=alt`: twenty seconds with the pool, twenty
 /// without, in turn, each change said in the log: a buffer made without
 /// is freed as before, and the spare ones wait for the next turn.
-/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
+/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said; enables quarter-octave classes).
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
-    let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !staging_pool() {
+    let size = staging_pool().then(|| staging_class(total, *STAGING_POOL_BYTES)).flatten();
+    let Some(size) = size else {
         // (Counted as made: the frame log's "staging N made" is then the
         // buffers of a run without the pool too.)
         SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
-    }
-    let spare = {
-        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = all.0.get_mut(&size).and_then(Vec::pop);
-        if taken.is_some() {
-            all.1 -= size;
-        }
-        taken
+        return host.staging_upload_buffer(total, total).map(|(buffer, data)| (buffer, data, 0));
     };
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size);
     if let Some(Spare(buffer, data)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
@@ -130,7 +143,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         return Some((buffer, data as *mut u8, size));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    host.staging_upload_buffer(size, total).map(|(buffer, data)| (buffer, data, size))
 }
 
 /// Whether staging buffers are taken from and returned to the spare ones
@@ -158,14 +171,6 @@ fn staging_pool() -> bool {
             on
         }
     }
-}
-
-/// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
-fn spare_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
-    })
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -511,11 +516,9 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
-            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= spare_most() {
-                all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
-            }
+            let spare = Spare(self.buffer.clone(), self.data as usize);
+            let excess = SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(self.pooled, spare);
+            drop(excess);
         }
     }
 }
@@ -1901,6 +1904,115 @@ mod title_memory_tests {
                     (times[1][3] + times[1][4]) / 2
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod staging_pool_tests {
+    #[test]
+    fn staging_pool_preserves_fork_defaults_and_respects_the_explicit_budget() {
+        let mib = 1 << 20;
+        assert_eq!(super::staging_class(mib + 1, None), Some(2 * mib));
+        assert_eq!(super::staging_class(8 * mib, None), Some(8 * mib));
+        assert_eq!(super::staging_class(8 * mib + 1, None), None);
+        assert_eq!(super::staging_class(mib + 1, Some(2 * mib)), Some(mib + mib / 4));
+        assert_eq!(super::staging_class(mib + 1, Some(mib)), None);
+        assert_eq!(super::staging_class(1, Some(0)), None);
+    }
+}
+
+/// What making a texture's host copy and its staging buffer costs on the
+/// host card, zeroed by the system or not, and with the staging buffer
+/// taken from the pool: a measurement (ignored by default), run with
+/// `cargo test -p victory-gpu --release --lib texture::creation_bench -- --ignored --nocapture`.
+#[cfg(test)]
+mod creation_bench {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    const COUNT: usize = 48;
+
+    fn texture_desc(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, size: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size,
+            Height: size as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 0,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; see the module notes"]
+    fn bench_creation() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU");
+            return;
+        };
+        let device = &host.device;
+        for (name, format, size) in [("BC7 2048", DXGI_FORMAT_BC7_UNORM, 2048u64), ("RGBA8 2048", DXGI_FORMAT_R8G8B8A8_UNORM, 2048)] {
+            let desc = texture_desc(format, size);
+            let mut total = 0u64;
+            // SAFETY: plain queries and creations with valid descriptions.
+            unsafe { device.GetCopyableFootprints(&desc, 0, 12, 0, None, None, None, Some(&mut total)) };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            for flags in [D3D12_HEAP_FLAG_NONE, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED] {
+                let mut kept = Vec::new();
+                let started = std::time::Instant::now();
+                for _ in 0..COUNT {
+                    let mut t: Option<ID3D12Resource> = None;
+                    // SAFETY: valid heap properties and resource description for benchmark allocation.
+                    unsafe {
+                        device
+                            .CreateCommittedResource(&heap, flags, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut t)
+                            .unwrap()
+                    };
+                    kept.push(t.unwrap());
+                }
+                let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+                println!("{name}: host texture {:>9.1} us each ({})", us, if flags == D3D12_HEAP_FLAG_NONE { "zeroed" } else { "not zeroed" });
+            }
+            // A staging buffer made, mapped and written whole (as a detile
+            // writes it), each way.
+            let fill = |data: *mut u8| {
+                // SAFETY: callers pass the mapped base of a staging allocation of `total` bytes.
+                unsafe { std::ptr::write_bytes(data, 0x5a, total as usize) };
+            };
+            for unzeroed in [false, true] {
+                let mut kept = Vec::new();
+                let started = std::time::Instant::now();
+                for _ in 0..COUNT {
+                    let (b, d) = if unzeroed { host.staging_upload_buffer(total, total) } else { host.upload_buffer(total) }.unwrap();
+                    fill(d);
+                    kept.push(b);
+                }
+                let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+                println!(
+                    "{name}: staging {:.1} MB made and written {:>9.1} us each ({})",
+                    total as f64 / 1e6,
+                    us,
+                    if unzeroed { "staging policy (VICTORY_NOT_ZEROED)" } else { "default allocation" }
+                );
+            }
+            // From the pool: made once, then taken and written.
+            let mut pool = crate::upload_pool::Pool::new(u64::MAX);
+            let capacity = crate::upload_pool::class(total);
+            for _ in 0..COUNT {
+                let (b, d) = host.staging_upload_buffer(capacity, total).unwrap();
+                assert!(pool.give(capacity, Spare(b, d as usize)).is_none());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..COUNT {
+                let Spare(b, d) = pool.take(total).unwrap();
+                fill(d as *mut u8);
+                drop(b);
+            }
+            let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+            println!("{name}: staging taken from the pool and written {us:>9.1} us each");
         }
     }
 }
