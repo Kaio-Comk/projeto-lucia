@@ -105,7 +105,8 @@ const SMALL_TILES: u32 = 16;
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        // The mip cap rides on levels on demand: it switches them on.
+        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") && mip_cap() == 0 {
             return false;
         }
         let Some(host) = host() else {
@@ -130,6 +131,49 @@ pub(crate) fn wanted() -> bool {
         );
         on
     })
+}
+
+/// Mip cap (Projeto Lucia, for 4 GB cards): `VICTORY_MIP_CAP=<n>` (0, off,
+/// by default; at most 4) leaves the `n` largest levels of a big texture
+/// without memory for good. A big texture is one whose larger side is at
+/// least `VICTORY_MIP_CAP_MIN` texels (2048 unless said). Each level cut
+/// is about three quarters of what the texture took: level 0 alone is
+/// 75 % of a full chain. It rides on levels on demand: such textures are
+/// made reserved (`resource.rs`), the levels cut are never held
+/// (`texture.rs` `held_levels`), and a view starts from the first level
+/// held ([`show_from`]), so shaders sample the next level down. The
+/// smallest levels the card packs together (the tail) are never cut.
+pub(crate) fn mip_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("VICTORY_MIP_CAP").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4);
+        if cap > 0 {
+            tracing::info!(cap, min = mip_cap_min(), "mip cap: the largest levels of big textures get no memory (VICTORY_MIP_CAP)");
+        }
+        cap
+    })
+}
+
+fn mip_cap_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_MIP_CAP_MIN").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048).max(256)
+    })
+}
+
+/// How many of the largest levels the mip cap takes from a texture of
+/// `width` x `height` texels with `levels` levels, of which the first
+/// `tail` are not in the packed tail: 0 if it is not big, and never the
+/// last level outside the tail (something sharp enough stays).
+pub(crate) fn levels_cut(width: u64, height: u32, levels: u32, tail: u32) -> u32 {
+    cut_for(mip_cap(), mip_cap_min(), width, height, levels, tail)
+}
+
+fn cut_for(cap: u32, min: u64, width: u64, height: u32, levels: u32, tail: u32) -> u32 {
+    if cap == 0 || width.max(u64::from(height)) < min || levels < 2 {
+        return 0;
+    }
+    cap.min(tail.min(levels).saturating_sub(1))
 }
 
 fn parse_floor(value: Option<&str>) -> u64 {
@@ -847,6 +891,36 @@ pub(crate) fn status() {
 /// at the first error or lost device with the step's name, before
 /// anything else is sent. On the card it does not run without the layer,
 /// and no wait is longer than 1.5 s.
+#[cfg(test)]
+mod mip_cap_tests {
+    use super::cut_for;
+
+    #[test]
+    fn small_textures_and_a_cap_of_zero_cut_nothing() {
+        assert_eq!(cut_for(0, 2048, 4096, 4096, 13, 9), 0);
+        assert_eq!(cut_for(2, 2048, 1024, 1024, 11, 7), 0);
+        assert_eq!(cut_for(2, 2048, 2047, 512, 12, 8), 0);
+    }
+
+    #[test]
+    fn big_textures_lose_their_largest_levels() {
+        // 2048 square: 12 levels, the tail from level 8.
+        assert_eq!(cut_for(1, 2048, 2048, 2048, 12, 8), 1);
+        assert_eq!(cut_for(2, 2048, 4096, 1024, 13, 9), 2);
+        // Wide counts: the larger side decides.
+        assert_eq!(cut_for(1, 2048, 512, 2048, 12, 8), 1);
+    }
+
+    #[test]
+    fn the_last_level_outside_the_tail_always_stays() {
+        // Only two levels before the tail: one may go, not both.
+        assert_eq!(cut_for(4, 2048, 2048, 2048, 12, 2), 1);
+        // No level outside the tail: nothing is cut.
+        assert_eq!(cut_for(4, 2048, 2048, 2048, 12, 0), 0);
+        assert_eq!(cut_for(4, 2048, 2048, 2048, 1, 1), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};

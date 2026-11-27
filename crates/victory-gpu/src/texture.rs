@@ -984,6 +984,15 @@ impl Staging {
             return u32::MAX;
         }
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
+        // The mip cap (`crate::tiles::mip_cap`): the largest levels of a
+        // big texture are never held, as if a view started below them.
+        let cut = crate::tiles::levels_cut(
+            u64::from(self.layout.desc.width),
+            self.layout.desc.height,
+            mips.len() as u32,
+            tail as u32,
+        );
+        let first = first.max(u64::from(cut));
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
         };
