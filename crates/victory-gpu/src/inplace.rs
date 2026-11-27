@@ -49,6 +49,9 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
+pub(crate) mod pool;
+pub use pool::{PoolCommit, title_memory_section_closed, uma_pool};
+
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
 /// The host's write watching (not in windows-sys' memory module).
@@ -90,6 +93,17 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// Bind a placed buffer over committed private title pages when `VICTORY_UMA=1`
+/// (opt-in; disabled with `VICTORY_UMA_PRIVATE=0`). Kept separate from legacy
+/// `VICTORY_INPLACE`.
+pub(crate) fn private_reads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_UMA").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_UMA_PRIVATE").is_none_or(|v| v == "1")
+    })
+}
+
 /// The most title memory in place at once, in bytes
 /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
 /// memory, also those the title never touched.
@@ -103,6 +117,58 @@ fn most() -> u64 {
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static DIRECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static DIRECT_IDS: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+
+/// Records a `Shadow::id()` whose memory is placed directly (`VICTORY_UMA=1`).
+#[allow(dead_code)]
+pub(crate) fn mark_direct_read(id: u64) {
+    let mut guard = DIRECT_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(Default::default);
+    if set.insert(id) {
+        DIRECT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Removes `Shadow::id()` from direct-read tracking on drop.
+#[allow(dead_code)]
+pub(crate) fn unmark_direct_read(id: u64) {
+    if DIRECT_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut guard = DIRECT_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_mut().is_some_and(|set| set.remove(&id)) {
+        DIRECT_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether `Shadow::id()` uses direct read placement (fast lock-free check when none).
+pub(crate) fn is_direct_read(id: u64) -> bool {
+    if DIRECT_COUNT.load(Ordering::Relaxed) == 0 || !private_reads() {
+        return false;
+    }
+    DIRECT_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&id))
+}
+
+/// Several small buffers can open the same page. Charge each opening to
+/// the budget because each placed resource keeps its opening alive.
+fn opening(start: u64, len: u64) -> Option<(u64, u64)> {
+    let page = K64 as u64;
+    let at = start - start % page;
+    let end = start.checked_add(len.max(1))?.checked_next_multiple_of(page)?;
+    Some((at, end - at))
+}
+
+pub(crate) fn skipped(requests: u64, bytes: u64) {
+    SKIPPED[0].fetch_add(requests, Ordering::Relaxed);
+    SKIPPED[1].fetch_add(bytes, Ordering::Relaxed);
+}
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -119,8 +185,7 @@ pub(crate) struct Placed {
 /// with nothing if the memory is not private memory committed whole
 /// (nothing was asked of the host), with the host's error if it refused.
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
-    let at = start & !(K64 as u64 - 1);
-    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let (at, bytes) = opening(start, len).ok_or(None)?;
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
@@ -134,8 +199,17 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
+#[allow(dead_code)]
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    place_for_mode(start, len, window, false)
+}
+
+/// As [`place_for`], additionally honouring `VICTORY_UMA=1` when `read_only`
+/// is true for small read-only private buffers.
+#[allow(dead_code)]
+pub(crate) fn place_for_mode(start: u64, len: u64, window: bool, read_only: bool) -> Option<Placed> {
+    let enabled = if private_reads() { read_only } else { level() >= if window { 1 } else { 2 } };
+    if !enabled {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -143,12 +217,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    let host = crate::host::host()?;
+    let (_, bytes) = opening(start, len)?;
+    let fits = if private_reads() {
+        OPEN_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                live.checked_add(bytes).filter(|&total| total <= most())
+            })
+            .is_ok()
+    } else {
+        STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len <= most()
+    };
+    if !fits {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = place_part(&host.device, start, len);
+    if placed.is_err() && private_reads() {
+        OPEN_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -169,10 +257,22 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 }
 
 /// What [`place_for`] gave is gone.
+#[allow(dead_code)]
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// What [`place_for_mode`] gave at `[start, start + bytes)` is gone.
+#[allow(dead_code)]
+pub(crate) fn gone_at(window: bool, start: u64, bytes: u64) {
+    if private_reads()
+        && let Some((_, opened)) = opening(start, bytes)
+    {
+        OPEN_BYTES.fetch_sub(opened, Ordering::Relaxed);
+    }
+    gone(window, bytes);
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -189,7 +289,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
-/// The line of what is in place, every ten seconds while [`level`] is on.
+/// The line of what is in place, every ten seconds while [`level`] or UMA is on.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
@@ -197,7 +297,20 @@ fn say() {
     if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
+    if uma_pool() {
+        pool::say();
+    }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if private_reads() {
+        let bytes = OPEN_BYTES.load(Ordering::Relaxed);
+        tracing::info!(
+            placed_pages = bytes / K64 as u64,
+            placed_mib = bytes >> 20,
+            skipped_refresh_requests = SKIPPED[0].swap(0, Ordering::Relaxed),
+            skipped_requested_bytes = SKIPPED[1].swap(0, Ordering::Relaxed),
+            "UMA private placement and refresh requests since the previous sample"
+        );
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
@@ -274,10 +387,16 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// Pagefile commit charges kept alive while the section or a host pool buffer lives.
+    charges: BTreeMap<usize, std::sync::Arc<PoolCommit>>,
 }
 
-static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views {
+    views: BTreeMap::new(),
+    pages: BTreeMap::new(),
+    sections: Vec::new(),
+    charges: BTreeMap::new(),
+});
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -306,6 +425,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views();
+        pool::changed();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
@@ -328,6 +448,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    if !gone.is_empty() {
+        pool::changed();
+    }
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
@@ -1211,7 +1334,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
+    if level() > 0 || private_reads() || uma_pool() {
         say();
     }
     if probe_level() == 0 {
@@ -1260,6 +1383,37 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_opening_counts_both_edge_pages_and_refuses_overflow() {
+        let page = K64 as u64;
+        assert_eq!(opening(2 * page - 1, 2), Some((page, 2 * page)));
+        assert_eq!(opening(page, page), Some((page, page)));
+        assert_eq!(opening(u64::MAX - 2, 2), None);
+        assert_eq!(opening(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn direct_read_registry_tracks_and_clears_ids() {
+        // Test the ID table directly without depending on process-wide env vars.
+        mark_direct_read(9001);
+        assert!(DIRECT_COUNT.load(Ordering::Relaxed) >= 1);
+        assert!(
+            DIRECT_IDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|s| s.contains(&9001))
+        );
+        unmark_direct_read(9001);
+        assert!(
+            !DIRECT_IDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|s| s.contains(&9001))
+        );
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
