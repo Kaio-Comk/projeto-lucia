@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+mod uma;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -2931,6 +2933,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Brings non-pool fragments of a raw title-memory copy up to date
+    /// (`VICTORY_UMA_POOL=1`).
+    PoolRead(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory; with the place it writes
     /// (address, bytes) when that is known (the title's memory-to-memory
     /// copies, `crate::list` `copy_memory`): [`near_writes`].
@@ -2994,9 +2999,24 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Direct UMA GPU readers keep their placed buffer alive and track ranges
+    /// for flight settlement ([`blocked_by`]).
+    direct: std::collections::HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    pool_bound: Option<usize>,
+    direct_requests: u64,
+    direct_bytes: u64,
 }
 
 impl Deferred {
+    fn direct_read(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, at: usize, bytes: usize) {
+        let end = at + bytes;
+        let span = self.direct.entry(shadow.id()).or_insert_with(|| (shadow.clone(), at, end));
+        span.1 = span.1.min(at);
+        span.2 = span.2.max(end);
+        self.direct_requests += 1;
+        self.direct_bytes += bytes as u64;
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3662,7 +3682,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         return None;
     }
     for list in runs {
-        for step in &list.deferred().copies {
+        let recording = list.deferred();
+        if recording.direct.values().any(|&(_, from, to)| touches(written, from, to)) {
+            return Some(WHY_READ);
+        }
+        for step in &recording.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
@@ -3715,7 +3739,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(..) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::PoolRead(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -6858,6 +6882,16 @@ impl Host {
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
+        let pool_bound = crate::inplace::pool::raw_reads()
+            .then(|| runs.iter().filter_map(|l| l.deferred().pool_bound).min())
+            .flatten();
+        // The shared raw directory may change a nonempty entry on a remap.
+        // Earlier GPU readers finish before that change.
+        let pool_reads = if let Some(bound) = pool_bound {
+            uma::prepare_directory(self, &mut submitted, runs, bound)
+        } else {
+            Default::default()
+        };
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6928,8 +6962,14 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut pool_ranges = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
+                    if let Step::PoolRead(shadow, at, len) = step
+                        && !shadow.unwatched()
+                    {
+                        pool_reads.fallback(*at, *len, |a, n| pool_ranges.push((a, a + n)));
+                    }
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
@@ -6940,7 +6980,7 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.into_values().chain(pool_ranges).collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
@@ -6959,7 +6999,7 @@ impl Host {
         }
         part = prep_part(0, part);
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, &pool_reads);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -8398,6 +8438,7 @@ impl HostList {
         {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
+                && deferred.direct.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
@@ -8501,12 +8542,25 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        if crate::inplace::is_direct_read(shadow.id()) {
+            deferred.direct_read(shadow, address, len);
+            return;
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    pub(crate) fn raw_pool_bound(&self, bound: usize) {
+        let mut recording = self.deferred();
+        recording.pool_bound = Some(recording.pool_bound.map_or(bound, |n| n.min(bound)));
+    }
+
+    pub(crate) fn defer_pool_read(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, at: usize, len: usize) {
+        self.deferred().copies.push(Step::PoolRead(shadow.clone(), at, len));
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -8860,10 +8914,14 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, pool_reads: &crate::memory::pool::Reads) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        if deferred.direct_requests != 0 {
+            crate::inplace::skipped(deferred.direct_requests, deferred.direct_bytes);
+        }
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -8897,6 +8955,20 @@ impl HostList {
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_fill(dst as *mut u8, src as *const u8, len);
                     len
+                }
+                Step::PoolRead(shadow, at, len) => {
+                    let mut fallback = 0;
+                    pool_reads.fallback(*at, *len, |a, n| {
+                        if n == *len {
+                            batch.add(shadow, a, n);
+                        } else {
+                            batch.flush_one(shadow);
+                            Batch::update(shadow, a, a + n);
+                        }
+                        fallback += n;
+                    });
+                    crate::inplace::pool::note_read(len - fallback);
+                    continue;
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
