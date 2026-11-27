@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "label": "G1 linha de base: series-s 1280x720 budgets 2048/512, parado nas telas de primeira execucao (sem input)",
+  "stage": "menu",
+  "frames": {
+    "count": 57,
+    "long_frames": 0,
+    "fps_avg": 29.63,
+    "fps_min": 16.92,
+    "fps_1pct_low": 16.92,
+    "frame_ms_p50": 33.30,
+    "frame_ms_p95": 33.50,
+    "frame_ms_p99": 59.10,
+    "frame_ms_max": 59.10
+  },
+  "cpu_gpu": {
+    "preparing_ms_avg": 0.31,
+    "preparing_ms_p95": 0.30,
+    "waiting_for_card_ms_avg": 0.00,
+    "gpu_ms_avg": 0.00,
+    "gpu_ms_p95": 0.00,
+    "copy_back_ms_avg": 0.01,
+    "max_draws_per_frame": 11,
+    "bottleneck": "cpu"
+  },
+  "memory": {
+    "vram_peak_mb": 841,
+    "vram_budget_min_mb": 3340,
+    "shared_vram_peak_mb": 462,
+    "commit_peak_mb": 25186,
+    "process_private_peak_mb": 5553,
+    "ram_free_min_mb": 2525
+  },
+  "shaders": {
+    "pipelines_refused": 0,
+    "compute_pipelines_refused": 0
+  },
+  "errors": {
+    "e_outofmemory": 0,
+    "device_removed": 0,
+    "tdr_or_hung": 0,
+    "error_lines": 0
+  }
+}
