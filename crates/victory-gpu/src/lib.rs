@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
+#[cfg(windows)]
+pub(crate) mod batch_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -80,6 +82,8 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+#[cfg(windows)]
+pub(crate) mod upload_pool;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
