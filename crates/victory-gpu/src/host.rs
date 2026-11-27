@@ -9895,6 +9895,32 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_as(size, D3D12_HEAP_FLAG_NONE)
+    }
+
+    /// With VICTORY_NOT_ZEROED=1 the allocator may skip clearing unused
+    /// size-class padding. Zero the entire exposed footprint ourselves:
+    /// sparse mip levels and row padding are not necessarily overwritten.
+    /// The default uses the fork's zero-initialized committed allocation.
+    #[allow(dead_code)]
+    pub(crate) fn staging_upload_buffer(&self, capacity: u64, used: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !not_zeroed() {
+            return self.upload_buffer(capacity);
+        }
+        let count = usize::try_from(used).ok()?;
+        if used > capacity || count > isize::MAX as usize {
+            return None;
+        }
+        let Some((buffer, data)) = self.upload_buffer_as(capacity, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) else {
+            return self.upload_buffer(capacity);
+        };
+        // SAFETY: the new mapped upload owns capacity bytes. Only the first
+        // used bytes can be referenced by the copyable texture footprints.
+        unsafe { std::ptr::write_bytes(data, 0, count) };
+        Some((buffer, data))
+    }
+
+    fn upload_buffer_as(&self, size: u64, flags: D3D12_HEAP_FLAGS) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9921,7 +9947,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    flags,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9940,6 +9966,14 @@ impl Host {
             }
         }
     }
+}
+
+/// Opt-in until the effect has been measured in the title. Only staging
+/// uploads with explicitly initialized footprints may request this flag.
+#[allow(dead_code)]
+pub(crate) fn not_zeroed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NOT_ZEROED").is_some_and(|v| v == "1"))
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
