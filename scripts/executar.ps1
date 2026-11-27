@@ -43,6 +43,19 @@ $padrao = @{
 }
 foreach ($k in $padrao.Keys) { if (-not $Env.ContainsKey($k)) { $Env[$k] = $padrao[$k] } }
 
+if ($Teclas -eq "mundo") {
+    # Do boot ao mundo (testado em 2026-11-26, primeira execucao com save novo):
+    # telas iniciais (Enter), Avisos legais (desce ate Avancar), Termos e
+    # politicas (marca as duas caixas e confirma; aceito com autorizacao do
+    # Kaio), depois Enter nas telas seguintes. Com save existente, as telas
+    # ja aceitas nao aparecem e os Enter extras nao fazem mal.
+    $k = @()
+    foreach ($s in 10..55) { if ($s % 5 -eq 0) { $k += "$($s):Enter" } }
+    $k += "68:Down", "72:Down", "76:Down", "80:Down", "85:Enter"
+    $k += "97:Enter", "101:Down", "105:Enter", "109:Down", "113:Enter"
+    foreach ($s in 124..300) { if ($s % 6 -eq 0) { $k += "$($s):Enter" } }
+    $Teclas = $k -join ","
+}
 if ($Teclas -match '^(\d+)-(\d+)/(\d+):(\w+)$') {
     $ini = [int]$Matches[1]; $fim = [int]$Matches[2]; $passo = [int]$Matches[3]; $tecla = $Matches[4]
     $Teclas = (($ini..$fim | Where-Object { ($_ - $ini) % $passo -eq 0 }) | ForEach-Object { "$($_):$tecla" }) -join ","
