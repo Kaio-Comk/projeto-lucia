@@ -76,6 +76,9 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// Reservation answers have both starts and ends in increasing order,
+    /// so [`cached`] can binary-search them.
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -89,6 +92,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     sub: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
 });
@@ -138,6 +142,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    j.ordered = false;
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -231,9 +236,21 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
+    if by_reservation() {
+        let mut pieces: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter(|r| r.0 < r.1)
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .collect();
+        pieces.sort_unstable();
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        ask_reservations(&mut j, &pieces);
+        return;
+    }
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    j.ordered = false;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
         j.asked += 1;
@@ -265,10 +282,123 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     j.kept = !j.ahead.is_empty();
 }
 
+/// With `VICTORY_WATCH_RESERVATION=0` a submission uses the original
+/// distance-based runs, recursive splits and remaining single ranges
+/// (on by default).
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_RESERVATION").is_none_or(|v| v != "0"))
+}
+
+/// The end (in pages) of the allocation holding page `first`, and whether
+/// it is private memory (write-watched), for sorted pieces that may join.
+/// A mapped view is left to the existing guard path.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query takes an address as input and fills our structure.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: the successful query filled the flags; bit zero is Private.
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Beyond the old eight MiB gap, join only substantial neighbours: two tiny
+/// copies far apart should not walk a GiB of page tables.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
+/// One asking per reservation group of the sorted `pieces` (page ranges),
+/// reserved holes included. Only a successful read-and-reset supplies an
+/// answer. A failed group is left to the individual refreshes in
+/// `writes`, as before.
+fn ask_reservations(j: &mut Journal, mut pieces: &[(usize, usize)]) {
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    j.ordered = true;
+    // Even an all-view submission has finished its ahead pass: the guards
+    // still check every refresh.
+    j.kept = !pieces.is_empty();
+    let mut allocation: Option<(usize, bool)> = None;
+    while let Some(&(first, end)) = pieces.first() {
+        if allocation.is_none_or(|(limit, _)| first >= limit) {
+            // An isolated piece takes one call; spend a query on the
+            // boundary only to join neighbours or skip a view. No boundary
+            // outlives this pass.
+            let neighbour = pieces.get(1).is_some_and(|&next| can_join(first, end, next));
+            allocation = if neighbour || known_view(first * PAGE) { reservation(first) } else { None };
+        }
+        let (limit, private) = allocation.unwrap_or((end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = pieces.get(n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        if (private || force_view_ask()) && ask_kernel(j, first, last) {
+            keep_requested(&mut j.ahead, &pieces[..n]);
+        }
+        pieces = &pieces[n..];
+    }
+}
+
+/// Starts arrive in order; keep ends in order too, so thousands of copies
+/// can look up their answers without walking every earlier piece. Touching
+/// requests share an entry only when one call covered them both.
+fn keep_requested(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
+    let mut same_call = false;
+    for &(start, end) in pieces {
+        if let Some((_, last)) = ahead.last_mut() {
+            if end <= *last {
+                continue;
+            }
+            if same_call && start <= *last {
+                *last = end;
+                continue;
+            }
+        }
+        ahead.push((start, end));
+        same_call = true;
+    }
+}
+
+/// What the journal says of pages `[first, last)` if one asking ahead
+/// covers them.
+fn cached(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let covered = if j.ordered {
+        let i = j.ahead.partition_point(|&(_, end)| end < last);
+        j.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+    } else {
+        j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+    };
+    covered.then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.ordered = false;
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -280,7 +410,7 @@ pub(crate) fn ask_once_end() {
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if !j.kept || j.ahead.is_empty() || len == 0 {
         return;
     }
     j.asked += 1;
@@ -508,10 +638,7 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    cached(&j, first, last)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -549,14 +676,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+    if let Some(answer) = cached(j, first, last) {
+        return Some(answer);
     }
     // The light refresh: every block of the range is read-only by our hand
     // and unwritten since an asking noted it, or a hole noted for good
@@ -744,13 +865,7 @@ const BLOCK: usize = PAGE;
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
-        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
-            .iter()
-            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
+    if force_view_ask() {
         return false;
     }
     let first = start / BLOCK;
@@ -761,6 +876,15 @@ fn known_view(start: usize) -> bool {
     }
     let g = guards();
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+}
+
+fn force_view_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
 }
 
 struct Guards {
@@ -2088,6 +2212,67 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    #[test]
+    fn touching_requests_share_an_entry_only_within_one_call() {
+        let mut ahead = vec![(1, 4)];
+        keep_requested(&mut ahead, &[(2, 3), (4, 6), (5, 9), (20, 22)]);
+        // (2,3) lies inside; (4,6) starts a new entry (not the same call as
+        // (1,4)); (5,9) joins it; (20,22) stands alone.
+        assert_eq!(ahead, [(1, 4), (4, 9), (20, 22)]);
+    }
+
+    #[test]
+    fn ordered_answers_are_found_by_binary_search() {
+        let mut j = Journal {
+            asked: 0,
+            written: BTreeMap::new(),
+            sub: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: vec![(10, 20), (30, 40)],
+            ordered: true,
+            ahead_asked: 7,
+            kept: true,
+        };
+        assert!(cached(&j, 12, 20).is_some_and(|(n, _)| n == 7));
+        assert!(cached(&j, 30, 31).is_some());
+        assert!(cached(&j, 18, 32).is_none());
+        assert!(cached(&j, 20, 25).is_none());
+        j.ordered = false;
+        assert!(cached(&j, 12, 20).is_some());
+        assert!(cached(&j, 18, 32).is_none());
+    }
+
+    #[test]
+    fn far_small_neighbours_do_not_join() {
+        assert!(can_join(0, 4, (5, 8)));
+        assert!(!can_join(0, 1, (AHEAD_GAP + 10, AHEAD_GAP + 11)));
+        assert!(!can_join(0, 4, (0, AHEAD_MAX + 1)));
+    }
+
+    #[test]
+    fn a_private_allocation_reports_its_end() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let size = 4 * PAGE;
+        // SAFETY: the test's own write-watched allocation.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(base, 0);
+        let (end, private) = reservation(base / PAGE + 1).expect("queried");
+        assert!(private);
+        assert_eq!(end, (base + size) / PAGE);
+        // SAFETY: the same allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
 }
 
 #[cfg(test)]
