@@ -20,12 +20,13 @@ param(
     [switch]$Captura,
     [hashtable]$Env = @{},
     [string]$Console = "series-s",
-    [string]$Jogo = "..\GTA6\game_scarlett_master.exe"
+    [string]$Jogo = ""   # padrao: ..\GTA6\game_scarlett_master.exe (a pasta do jogo ao lado do repositorio)
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+if (-not $Jogo) { $Jogo = Join-Path (Split-Path -Parent $repo) "GTA6\game_scarlett_master.exe" }
 $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
 $dir = Join-Path (Split-Path -Parent $repo) "runs\$stamp-$Nome"
 New-Item -ItemType Directory -Force $dir | Out-Null
@@ -44,7 +45,7 @@ if ($Teclas -eq "mundo") {
     # Do boot ao mundo (testado em 2026-11-26, primeira execucao com save novo):
     # telas iniciais (Enter), Avisos legais (desce ate Avancar), Termos e
     # politicas (marca as duas caixas e confirma; aceito com autorizacao do
-    # Kaio), depois Enter nas telas seguintes. Com save existente, as telas
+    # dono da maquina), depois Enter nas telas seguintes. Com save existente, as telas
     # ja aceitas nao aparecem e os Enter extras nao fazem mal.
     $k = @()
     foreach ($s in 10..55) { if ($s % 5 -eq 0) { $k += "$($s):Enter" } }

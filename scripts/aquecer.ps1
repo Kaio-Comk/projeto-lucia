@@ -10,11 +10,12 @@ param(
     [switch]$Tudo,
     [switch]$Diag,
     [int]$Jobs = 6,
-    [string]$Jogo = "..\GTA6"
+    [string]$Jogo = ""   # padrao: ..\GTA6 (a pasta do jogo ao lado do repositorio)
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+if (-not $Jogo) { $Jogo = Join-Path (Split-Path -Parent $repo) "GTA6" }
 . (Join-Path $PSScriptRoot "perfil-pc4gb.ps1")
 foreach ($k in $PerfilPc4gb.Keys) { Set-Item -Path "Env:$k" -Value $PerfilPc4gb[$k] }
 # O que o jogo diz do host nesta placa (log: "host wave lanes min=32", "host view heaps hold 1000000 views").
