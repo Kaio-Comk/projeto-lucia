@@ -6,7 +6,7 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
-#[cfg(all(windows, feature = "host"))]
+#[cfg(all(windows, any(test, feature = "host")))]
 pub mod agility;
 pub mod bvh;
 pub mod dxbc;

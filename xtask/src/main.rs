@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod bench;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,17 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Parse a runtime log and write a numeric benchmark summary to bench/YYYY-MM-DD-HHMM.json.
+    Bench {
+        /// Path to the runtime log file to analyze.
+        log: PathBuf,
+        /// Optional output JSON path (defaults to bench/YYYY-MM-DD-HHMM.json).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Optional run label stored in the JSON report.
+        #[arg(short, long)]
+        label: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -43,6 +55,10 @@ fn main() -> Result<()> {
                 "git config failed (is this a git repository?)"
             );
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
+            Ok(())
+        }
+        Cmd::Bench { log, out, label } => {
+            bench::run(&root, &log, out.as_deref(), label.as_deref())?;
             Ok(())
         }
     }
