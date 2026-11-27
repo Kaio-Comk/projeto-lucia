@@ -35,13 +35,10 @@ $exe = if ($Diag) { "target\diag\release\victory.exe" } else { "target\release\v
 if (-not (Test-Path $exe)) { throw "Nao achei $exe. Compile antes (cargo build --release -p victory$(if($Diag){' --features diagnostics --target-dir target\diag'}))." }
 if (-not (Test-Path (Join-Path (Split-Path $exe) "D3D12\D3D12Core.dll"))) { Write-Warning "Sem D3D12\D3D12Core.dll ao lado do exe: o Agility SDK nao vai carregar (SM 6.5, shaders recusados)." }
 
-$padrao = @{
-    VICTORY_DISPLAY_MODE      = "1280x720"
-    VICTORY_TEXTURE_BUDGET_MB = "2048"
-    VICTORY_CARD_BUFFERS_MB   = "512"
-    VICTORY_D3D12_DRED        = "faults"
-}
-foreach ($k in $padrao.Keys) { if (-not $Env.ContainsKey($k)) { $Env[$k] = $padrao[$k] } }
+# O perfil deste PC (scripts\perfil-pc4gb.ps1); -Env sobrepoe, e um valor vazio tira a chave.
+. (Join-Path $PSScriptRoot "perfil-pc4gb.ps1")
+foreach ($k in $PerfilPc4gb.Keys) { if (-not $Env.ContainsKey($k)) { $Env[$k] = $PerfilPc4gb[$k] } }
+foreach ($k in @($Env.Keys)) { if ($Env[$k] -eq '') { $Env.Remove($k); Remove-Item "Env:$k" -ErrorAction SilentlyContinue } }
 
 if ($Teclas -eq "mundo") {
     # Do boot ao mundo (testado em 2026-11-26, primeira execucao com save novo):

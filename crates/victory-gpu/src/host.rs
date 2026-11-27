@@ -9708,7 +9708,8 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             let _timed = StepTimed(
                 match step {
-                    Step::Copy(..) => 0,
+                    // (a read through the UMA pool is a copy: 0063-uma, Trilha B)
+                    Step::Copy(..) | Step::PoolRead(..) => 0,
                     Step::Fill(..) => 1,
                     Step::Refresh(..) => 2,
                     Step::Run(..) => 3,
