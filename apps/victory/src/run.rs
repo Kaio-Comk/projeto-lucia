@@ -102,6 +102,15 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The output size, render scale and upscaler (VICTORY_OUTPUT,
+    // VICTORY_RENDER_SCALE, VICTORY_UPSCALER; the title's own upscaler by
+    // default): ported from ScarlettPort (`victory_loader::resolution`).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

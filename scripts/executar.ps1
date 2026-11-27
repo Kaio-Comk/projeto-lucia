@@ -20,12 +20,13 @@ param(
     [switch]$Captura,
     [hashtable]$Env = @{},
     [string]$Console = "series-s",
-    [string]$Jogo = "..\GTA6\game_scarlett_master.exe"
+    [string]$Jogo = ""   # padrao: ..\GTA6\game_scarlett_master.exe (a pasta do jogo ao lado do repositorio)
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+if (-not $Jogo) { $Jogo = Join-Path (Split-Path -Parent $repo) "GTA6\game_scarlett_master.exe" }
 $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
 $dir = Join-Path (Split-Path -Parent $repo) "runs\$stamp-$Nome"
 New-Item -ItemType Directory -Force $dir | Out-Null
@@ -35,19 +36,16 @@ $exe = if ($Diag) { "target\diag\release\victory.exe" } else { "target\release\v
 if (-not (Test-Path $exe)) { throw "Nao achei $exe. Compile antes (cargo build --release -p victory$(if($Diag){' --features diagnostics --target-dir target\diag'}))." }
 if (-not (Test-Path (Join-Path (Split-Path $exe) "D3D12\D3D12Core.dll"))) { Write-Warning "Sem D3D12\D3D12Core.dll ao lado do exe: o Agility SDK nao vai carregar (SM 6.5, shaders recusados)." }
 
-$padrao = @{
-    VICTORY_DISPLAY_MODE      = "1280x720"
-    VICTORY_TEXTURE_BUDGET_MB = "2048"
-    VICTORY_CARD_BUFFERS_MB   = "512"
-    VICTORY_D3D12_DRED        = "faults"
-}
-foreach ($k in $padrao.Keys) { if (-not $Env.ContainsKey($k)) { $Env[$k] = $padrao[$k] } }
+# O perfil deste PC (scripts\perfil-pc4gb.ps1); -Env sobrepoe, e um valor vazio tira a chave.
+. (Join-Path $PSScriptRoot "perfil-pc4gb.ps1")
+foreach ($k in $PerfilPc4gb.Keys) { if (-not $Env.ContainsKey($k)) { $Env[$k] = $PerfilPc4gb[$k] } }
+foreach ($k in @($Env.Keys)) { if ($Env[$k] -eq '') { $Env.Remove($k); Remove-Item "Env:$k" -ErrorAction SilentlyContinue } }
 
 if ($Teclas -eq "mundo") {
     # Do boot ao mundo (testado em 2026-11-26, primeira execucao com save novo):
     # telas iniciais (Enter), Avisos legais (desce ate Avancar), Termos e
     # politicas (marca as duas caixas e confirma; aceito com autorizacao do
-    # Kaio), depois Enter nas telas seguintes. Com save existente, as telas
+    # dono da maquina), depois Enter nas telas seguintes. Com save existente, as telas
     # ja aceitas nao aparecem e os Enter extras nao fazem mal.
     $k = @()
     foreach ($s in 10..55) { if ($s % 5 -eq 0) { $k += "$($s):Enter" } }
