@@ -1633,6 +1633,11 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -3450,6 +3455,57 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
+    }
+
+    /// Applies the ambient pass to the diffuse resolve or reflection
+    /// history (`crate::ambient`, from VItoriaBr).
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        if self.record_ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    fn record_ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        if stage.shader.ends_reflections && !stage.shader.resolves_light {
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::reflect(list, r as This),
+                _ => false,
+            };
+        }
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4762,6 +4818,9 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if p.stages.first().is_some_and(|s| s.shader.ends_reflections) {
+                self.ambient(list, p);
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

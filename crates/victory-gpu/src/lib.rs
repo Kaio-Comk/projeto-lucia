@@ -22,6 +22,8 @@ pub(crate) mod batch_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod cardmeter;
 #[cfg(windows)]
 mod compose;
