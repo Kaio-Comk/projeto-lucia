@@ -1292,10 +1292,11 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, with the second
+/// plane (a Series S title's interface) laid over it (`crate::compose`).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: no scaling or placement, the source expected in the common
+/// state.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1313,6 +1314,72 @@ extern "system" fn present(
         crate::fence::pace::frame();
     }
     hr
+}
+
+/// The second plane's host copy, its GPU state, and the title resource, when
+/// the present carries one (`crate::compose`). The state is left in
+/// `COPY_SOURCE` for the compose pass; the caller restores it after showing.
+/// (Projeto Lucia: from VItoriaBr, GPL-3.0-or-later. Without it a Series S
+/// title's menus came out black: only the empty game plane was shown.)
+#[cfg(windows)]
+fn second_plane(
+    planes: u32,
+    plane_parameters: *const Plane,
+) -> Option<(This, std::sync::Arc<crate::resource::HostTexture>, u32)> {
+    // Said once per plane count: how many planes the title presents and,
+    // with two, how far the second got (Projeto Lucia diagnostics for the
+    // black menus on Series S).
+    static SAID: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let say = |what: &str| {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if !said.contains(&planes) {
+            said.push(planes);
+            tracing::info!(planes, what, "planes the title presents");
+        }
+    };
+    if planes < 2 || plane_parameters.is_null() {
+        say("one plane: shown as it is");
+        return None;
+    }
+    // A retail PresentX plane description is 72 bytes (the prefix [`Plane`],
+    // then source rectangles, destination, colour space and seven option
+    // words; found by the VIctory-7900XTX fork), not the 24 of the prefix:
+    // stepping by the prefix's size lands inside the first description and
+    // finds no resource. The 72-byte step is tried first, then the short
+    // one; a resource only counts if it is one of the title's textures.
+    const RETAIL_STRIDE: usize = 72;
+    let found = [RETAIL_STRIDE, size_of::<Plane>()].into_iter().find_map(|stride| {
+        // Read through the kernel (`read_into`): with a short layout the
+        // 72-byte step may point past the title's array.
+        let mut bytes = [0u8; size_of::<Plane>()];
+        if !crate::host::read_into(plane_parameters.cast::<u8>().wrapping_add(stride), &mut bytes) {
+            return None;
+        }
+        // SAFETY: the prefix has the C layout of `Plane`; its bytes were copied.
+        let plane = unsafe { bytes.as_ptr().cast::<Plane>().read_unaligned() };
+        let mut pointer = [0u8; size_of::<This>()];
+        if plane.count == 0
+            || plane.resources.is_null()
+            || !crate::host::read_into(plane.resources.cast(), &mut pointer)
+        {
+            return None;
+        }
+        let resource = usize::from_ne_bytes(pointer) as This;
+        crate::resource::host_copy(resource).map(|copy| (resource, copy, stride))
+    });
+    let Some((resource, copy, stride)) = found else {
+        say("second plane: no resource of the title's at a 72- or 24-byte step");
+        return None;
+    };
+    if stride != RETAIL_STRIDE {
+        say("second plane: found at the short 24-byte step");
+    }
+    let Some((_, before)) = crate::resource::host_transition(resource, 0x800) else {
+        say("second plane: its state could not be moved");
+        return None;
+    };
+    say("second plane: laid over the first");
+    Some((resource, copy, before))
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
@@ -1415,7 +1482,14 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let second = second_plane(planes, plane_parameters);
+        let over = second
+            .as_ref()
+            .map(|(_, copy, before)| (&copy.texture, *before));
+        let shown = host.present_over(texture, state, over, frame);
+        if let Some((resource, _, before)) = second {
+            crate::resource::host_transition(resource, before);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
