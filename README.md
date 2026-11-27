@@ -1,82 +1,103 @@
-# Projeto Lucia (Lucia Runtime)
+# Projeto Lucia
 
-An experimental **Xbox Series X|S → Windows x64** compatibility layer written in **Rust** on top of **Direct3D 12**, tailored specifically for **entry-level and mid-range PCs (4 GB VRAM, 16 GB system RAM, 4-core CPUs)** rather than high-end 16–24 GB GPUs.
+An experimental **Xbox Series X|S → Windows x64** compatibility layer in **Rust** over **Direct3D 12**, built on
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory),
+and aimed at **modest PCs**: a **4 GB** NVIDIA card, **16 GB** of RAM, a **4-core** CPU and **Windows 10**. The other
+public forks are measured on 10-24 GB cards; this one is about what it takes to run on hardware many people actually have.
 
-> **Important:** This repository contains **zero game files, executables, keys, assets, captures, or download links**. To run anything, you must supply your own lawfully obtained, unpacked title directory kept completely outside this repository (`docs/asset-policy.md`).
+> **No game data here.** This repository holds no game files, executables, keys, assets, captures or download links.
+> To run anything you supply your own unpacked title directory, kept outside the repository (see `docs/asset-policy.md`;
+> `cargo xtask policy` checks every commit).
 
----
+## Status (2026-11-27, measured on the target PC)
 
-## Scope & Architecture
+| Stage | State |
+|-------|-------|
+| Boot on Windows 10 | ✅ needs the D3D12 Agility SDK (see below): Windows 10's own runtime stops at Shader Model 6.5 |
+| First-boot screens, legal and terms screens, menus | ✅ 30 fps (they were black before the interface-plane fix below) |
+| Loading screens with artwork | ✅ |
+| The world | 🟡 reached and running (4,000-5,700 draws a frame, the "move / move the camera" hint shows), **about 5-6 fps**; the picture is dark wherever no direct light falls |
+| Playable | ❌ not yet |
 
-Console titles compiled for Xbox Series x86-64 execute natively on Windows CPUs, while the runtime replaces console-only OS and graphics interfaces:
+Target PC: Intel Xeon E3-1270 v3 (4c/8t, Haswell) · NVIDIA GeForce GTX 1650 SUPER 4 GB (Turing, Wave32, no RT cores) ·
+16 GB RAM · Windows 10 Pro 19045 · Series S profile.
 
-- **PE Loader & Console HLE:** `kernelx`, `xgameruntime`, memory management, storage queues, audio, and input.
-- **RDNA2 Shader Recompiler:** translates console RDNA2 programs into **DXIL** for host D3D12 pipelines (`d3d12_xs` → PC Direct3D 12).
-- **Low-VRAM / Low-RAM Focus:** reduces duplicate CPU/GPU memory footprints, constrains staging and texture budgets, and targets **Series S** rendering profiles with ray tracing disabled.
+Measured in the world (runs of 8-12 minutes, `scripts/executar.ps1`):
 
----
+| Measure | Value |
+|---------|-------|
+| Frame | 300-370 ms (about 3 fps in the heaviest views, 5-6 fps on average) |
+| Preparing submissions (CPU) | 140-200 ms a frame |
+| GPU | 60-115 ms a frame |
+| Video memory | about 3.9 GB of the card's 4 GB (Windows gives it a budget of 3.3 GB; the rest spills to shared memory) |
+| Commit | 35-37 GB (a 32-48 GB pagefile on an SSD is needed) |
 
-## Target Hardware Profile
+Known limits, honestly:
+- **Shadowed areas are black.** The title's bounce light and its lamp and sun shadows are ray traced in compute
+  programs that do not run on NVIDIA cards in any public build yet; a constant ambient light (`ambient.rs`) only lifts the
+  floor. The first room of the game is an interior, so most of it is dark.
+- **The first entry into the world must not compile shaders**: about 1,600 pipelines at once on a 4-core CPU make the
+  title's own GPU watchdog end the process. Run `scripts/aquecer.ps1` once after every build (it pre-translates the
+  shaders seen in earlier runs).
+- The structure builder for ray tracing stays off (`VICTORY_BVH_BUILDER=0`): upstream reports a crash 30-40 s after it starts.
 
-This project is developed and profiled around modest desktop hardware:
+## What Projeto Lucia adds
 
-| Component | Specification | Notes |
-| --- | --- | --- |
-| **CPU** | Intel Xeon E3-1270 v3 @ 3.50 GHz (4c / 8t, Haswell) | AVX2 supported; 4 cores require minimal submission thread overhead |
-| **GPU** | NVIDIA GeForce GTX 1650 SUPER (4 GB VRAM, Turing) | Shader Model 6.6 + Mesh Shaders Tier 1, Wave32, no RT Cores, strict 4 GB VRAM ceiling |
-| **RAM** | 16 GB system memory | Requires SSD pagefile headroom and reduced CPU/GPU shadow duplication |
-| **OS** | Windows 10 Pro x64 (Build 19045) | — |
+- **Windows 10 support: the D3D12 Agility SDK loaded at run time** (`victory-shader/src/agility.rs`, own code from
+  Microsoft's documented API). Devices, the debug layer, DRED and root-signature serialization all come from the
+  Agility runtime (`ID3D12SDKConfiguration1::CreateDeviceFactory`): the inbox `D3D12SerializeVersionedRootSignature`
+  refuses the Shader Model 6.6 flags on Windows 10 even with an Agility device. Folders are passed by their 8.3 name:
+  a path with a space made `CreateDeviceFactory` fail (`0x887E0003`).
+- **Series S menus were black: the interface plane.** A Series S title presents two planes (the game, and the interface
+  at 3840x2160); only the first was shown, and the second was looked for at a 24-byte step where the retail
+  PresentX description is 72 bytes. Fixed (`queue.rs` `second_plane`, composition from VItoriaBr's `compose.rs`).
+- **Mip cap for 4 GB cards** (`VICTORY_MIP_CAP=<n>`, `tiles.rs`): the largest levels of big textures never get card
+  memory, using the reserved-texture "levels on demand" machinery; -410 MB of live textures with `n=1` in the world.
+- **Where the video memory goes**: the periodic memory line now splits committed textures by kind and says why title
+  textures miss the mip cap (most of what is left: thousands of textures under 1 MB).
+- **Run tooling**: `scripts/executar.ps1` turns every run into a folder with the game log, the PC's CPU/RAM/commit/disk
+  every 2 s, the card's temperature/use/VRAM/clock/power every second (`nvidia-smi`), the `cargo xtask bench` summary and
+  a `resumo.md` with alerts and the screens passed; `-Teclas mundo` drives a fresh save from boot to the world.
+  `scripts/perfil-pc4gb.ps1` is the switch set for the target PC, shared by runs, the shader warm-up and play.
+- `translate --warm <list>` names each shader it finds (its program), to tell them apart in a run's log.
 
----
+## Running
 
-## Current Status
-
-**Early setup / baseline initialized.** No boot, frame-time, or gameplay claims are reported yet until verified locally on the target machine after toolchain setup and testing.
-
-| Stage | Status | Notes |
-| --- | --- | --- |
-| Workspace & clean GPL-3.0 baseline | ✅ Ready | Initialized from `victory-fork` without third-party logs |
-| Local build & unit tests (`cargo test`) | ⏳ Pending | Requires Rust MSVC toolchain installation |
-| Hardware smoke test (GTX 1650 SUPER 4 GB) | ⏳ Pending | Awaiting title extraction and first run logs |
-| Low-VRAM mip-cap & memory-pressure layer | ⏳ Planned | Core differentiator under design |
-
----
-
-## Planned Engineering Work
-
-What sets **Projeto Lucia** apart from existing high-VRAM forks:
-
-1. **4 GB VRAM Texture Mip-Cap & Eviction:** trimming top mip levels (`mip 0` / `mip 1`) on large 2K/4K textures during creation/upload to cut texture VRAM usage by ~75% and prevent `E_OUTOFMEMORY` / TDR resets.
-2. **16 GB RAM Residency & Zero-Copy Paths:** adapting commit/RAM pressure monitoring (`GlobalMemoryStatusEx`) and direct CPU-written constant heap reads (`OpenExistingHeapFromAddress1`) to minimize duplicate host buffers.
-3. **NVIDIA Wave32 & No-RT Compatibility:** paired Wave64 → Wave32 compute support, safe barrier lowering, LDS bounds checks, and lightweight ambient lighting fallback without ray tracing.
-
----
-
-## Building from Source
-
-### Prerequisites
-- Windows 10 / 11 x64
-- CPU with **AVX2**
-- Direct3D 12 GPU supporting **Shader Model 6.6** and **Mesh Shaders**
-- **Rust** (`x86_64-pc-windows-msvc`, pinned in `rust-toolchain.toml`)
-- **Visual Studio Build Tools** (Desktop development with C++, x64 MSVC toolset, Windows 10/11 SDK)
-
-### Commands
 ```powershell
-# 1. Configure external paths (kept outside git)
+# Build (Rust and VS Build Tools with the Windows SDK)
+cargo build --release -p victory
+
+# Windows 10: the Agility SDK beside the executable (from Microsoft's NuGet package
+# Microsoft.Direct3D.D3D12; never commit the DLL)
+mkdir target\release\D3D12
+copy <package>\build\native\bin\x64\D3D12Core.dll target\release\D3D12\
+
+# The title directory: victory.toml (game_dir), or ..\GTA6 beside this repository for the scripts
 copy victory.example.toml victory.toml
 
-# 2. Verify workspace tests (no game files required)
-cargo test --workspace
+# Once after every build: pre-translate the shaders
+.\scripts\aquecer.ps1
 
-# 3. Build release binary
-cargo build --release -p victory
+# Play (keyboard as a pad: Enter = A, Backspace = B, WASD / IJKL sticks, arrows = D-pad, Esc = Menu)
+.\scripts\executar.ps1 -Nome jogar -Segundos 86400
 ```
 
----
+## Credits
 
-## Credits & License
+Projeto Lucia is a fork; most of the runtime is other people's work:
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory) and its contributors: the loader, runtime services, Direct3D 12
+  renderer and shader recompiler (GPL-3.0-or-later).
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (hyphennn) and its contributors: the base of this
+  repository, merged up to 2026-11-27 (GPL-3.0-or-later).
+- [uiliannn/VItoriaBr](https://github.com/uiliannn/VItoriaBr) (Uilian): `compose.rs`, `ambient.rs` (first ported from
+  Belobug) and the packed dot-product lowering.
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD): the ambient light fallback.
+- [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX): the retail PresentX plane layout (72 bytes),
+  used here as documented fact, code written anew.
+- [stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq): patches 0002, 0012, 0015, 0026, 0045 and 0063,
+  rebuilt for this base.
+- No code from XCL (GPL-2.0-only) is in this repository.
 
-- Licensed under **GPL-3.0-or-later** — see [LICENSE](LICENSE).
-- Built upon **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** (both GPL-3.0-or-later).
-- **License boundary:** No **GPL-2.0-only** code from XCL is copied into this repository.
+## License
+
+GPL-3.0-or-later; see [LICENSE](LICENSE).
