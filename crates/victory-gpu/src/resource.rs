@@ -1399,6 +1399,27 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        // Why a texture of the title's is made with all its memory: bytes
+        // by first reason (Projeto Lucia: what the mip cap does not reach).
+        if texture.is_none() && fills(&r.desc) {
+            let bytes = footprint(&r.desc).map_or(0, |f| f.size);
+            let reason = if r.desc.dimension != TEXTURE_2D {
+                0 // not 2D (3D, 1D)
+            } else if r.desc.depth_or_array_size != 1 {
+                1 // an array or cube
+            } else if r.desc.mip_levels <= 1 {
+                2 // a single level
+            } else if !r.host.placed.load(Relaxed) {
+                3 // not placed in title memory
+            } else if !texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor()) {
+                4 // a layout the upload cannot read level by level (XOR)
+            } else if bytes < crate::tiles::floor() {
+                5 // under the floor (a megabyte)
+            } else {
+                6 // eligible but held whole (below the cap's size, or the card refused)
+            };
+            WHOLE_BYTES[reason].fetch_add(bytes, Relaxed);
+        }
         let texture = match texture {
             Some(texture) => Ok(texture),
             None => host_texture(&r.desc, r.host.state, clear),
@@ -2256,7 +2277,54 @@ fn host_texture_as(
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
+    if !reserved {
+        // SAFETY: a live texture's own description.
+        let desc = unsafe { texture.GetDesc() };
+        // SAFETY: a plain query of one description.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+        made_bytes(d.flags, bytes, || format!("{}x{} f{} flags {:#x} levels {}", d.width, d.height, d.format, d.flags, d.mip_levels));
+    }
     Ok(texture)
+}
+
+/// Card memory of the committed host textures made so far, by kind:
+/// render targets, depth, unordered access, the rest (Projeto Lucia: to
+/// see what fills a 4 GB card). Kinds by the description's flags.
+#[cfg(windows)]
+static MADE_BYTES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+fn made_bytes(flags: u32, bytes: u64, what: impl FnOnce() -> String) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kind = match flags & 0x7 {
+        f if f & 2 != 0 => 1,
+        f if f & 1 != 0 => 0,
+        f if f & 4 != 0 => 2,
+        _ => 3,
+    };
+    MADE_BYTES[kind].fetch_add(bytes, Relaxed);
+    // The big ones, once each kind of size: what they are.
+    if bytes >= 32 << 20 {
+        tracing::info!(mb = bytes >> 20, kind = ["render target", "depth", "unordered access", "plain"][kind], what = %what(), "a big host texture");
+    }
+}
+
+/// Bytes of title-filled textures made with all their memory, by first
+/// reason: not 2D, array or cube, one level, not placed, XOR layout, under
+/// the floor, eligible but whole.
+#[cfg(windows)]
+static WHOLE_BYTES: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// [`WHOLE_BYTES`] in megabytes, for the memory line.
+#[cfg(windows)]
+pub(crate) fn whole_megabytes() -> [u64; 7] {
+    WHOLE_BYTES.each_ref().map(|b| b.load(std::sync::atomic::Ordering::Relaxed) >> 20)
+}
+
+/// [`MADE_BYTES`] in megabytes: render targets, depth, unordered access, rest.
+#[cfg(windows)]
+pub(crate) fn made_megabytes() -> [u64; 4] {
+    MADE_BYTES.each_ref().map(|b| b.load(std::sync::atomic::Ordering::Relaxed) >> 20)
 }
 
 /// The host copy of title texture `this` if it is made and was made

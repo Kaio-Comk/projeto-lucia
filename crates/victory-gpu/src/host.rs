@@ -602,10 +602,15 @@ fn video_memory_line() {
     if looks == 0 {
         return;
     }
+    let made = crate::resource::made_megabytes();
+    let whole = crate::resource::whole_megabytes();
     tracing::info!(
         "video memory in the {} ms since the last such line, at {looks} looks: the card's own in use at most {} MB, its budget at least {} MB, \
          the PC's shared in use at most {} MB; made in that time: upload buffers {} MB, shared buffers {} MB, card buffers {} MB, \
-         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go; \
+         committed host textures made so far by kind: render targets {} MB, depth {} MB, unordered access {} MB, plain {} MB; \
+         title textures made whole, by why: not 2D {} MB, array or cube {} MB, one level {} MB, not placed {} MB, XOR layout {} MB, \
+         under a megabyte {} MB, eligible but whole {} MB",
         at.saturating_sub(before),
         most >> 20,
         least >> 20,
@@ -617,6 +622,17 @@ fn video_memory_line() {
         now[3] >> 20,
         then[3] >> 20,
         now[4].saturating_sub(then[4]) >> 20,
+        made[0],
+        made[1],
+        made[2],
+        made[3],
+        whole[0],
+        whole[1],
+        whole[2],
+        whole[3],
+        whole[4],
+        whole[5],
+        whole[6],
     );
 }
 
