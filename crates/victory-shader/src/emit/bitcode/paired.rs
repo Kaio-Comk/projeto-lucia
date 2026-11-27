@@ -1,5 +1,6 @@
-﻿//! Ported from patch 0052-wave64 (GPL-3.0-or-later); independent paired-lane
-//! lowering inspired by XCL 3ecf4cf without copying GPL-2.0 code.
+﻿//! Ported from Kelvaroq patch `0052-wave64` (GPL-3.0-or-later; credit only —
+//! no Kelvaroq branding or logo). Independent paired-lane lowering after
+//! XCL `3ecf4cf` without copying GPL-2.0 code.
 //!
 //! Preserve both halves of a guest wave and make its scalar decisions once.
 //! Here a host lane keeps two sets of SSA values. Lane 7, for example, executes
