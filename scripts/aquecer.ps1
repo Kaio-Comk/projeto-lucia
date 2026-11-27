@@ -40,5 +40,8 @@ if ($Tudo) {
     Write-Host "Shaders conhecidos dos logs: $($set.Count)"
 }
 $sw = [Diagnostics.Stopwatch]::StartNew()
-& $exe translate --warm $lista --jobs $Jobs $Jogo 2>&1 | Where-Object { $_ -notmatch 'warm-up      found ' }
+# The translator writes notes to stderr; in Windows PowerShell 5.1 that is an
+# error record, which "Stop" would turn into an abort.
+$ErrorActionPreference = "Continue"
+& $exe translate --warm $lista --jobs $Jobs $Jogo 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch 'warm-up      found ' }
 Write-Host "Aquecimento em $([math]::Round($sw.Elapsed.TotalMinutes, 1)) min ($exe)"
