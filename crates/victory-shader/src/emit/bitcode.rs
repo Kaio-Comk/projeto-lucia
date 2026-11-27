@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
+// Projeto Lucia: the Kelvaroq paired form (Trilha B), kept while upstream's
+// `emit::paired` is the one in use (see `emit_paired` in mod.rs).
+#[allow(dead_code)]
 pub(super) mod paired;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -109,11 +112,45 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
+}
+
+/// The fast-math flags the 32-bit float binary operations carry with
+/// `opt::FAST`, as LLVM 3.7 bitcode writes them: 1 unsafe algebra (which
+/// in 3.7 implies all the others), 2 no NaNs, 4 no infinities, 8 no signed
+/// zeros, 16 allow reciprocal. `VICTORY_SHADER_FAST_BITS` (a number) picks
+/// them; unset, 24 (no signed zeros and reciprocal: with 1, every flag,
+/// runs 354/355 showed black blotches on skin and clothes). With unsafe algebra or no-NaNs/no-infinities a driver may
+/// take an operation's result as never NaN or infinite and fold a later
+/// test of it (`fcmp uno`, a compare against infinity) to a constant; 24
+/// (no signed zeros, reciprocal) keeps NaN and infinity tests but may also
+/// keep the driver from fusing or reassociating (not measured). Part of the
+/// translation (the switch scan of `build.rs` keys the cache on it).
+fn fast_math_bits() -> u64 {
+    static BITS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_SHADER_FAST_BITS")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim();
+                match v.strip_prefix("0x") {
+                    Some(h) => u64::from_str_radix(h, 16).ok(),
+                    None => v.parse().ok(),
+                }
+            })
+            .map_or(24, |b| b & 0x1F)
+    })
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // FALSE, ORD and the unordered ones but UNE are not emitted: a NaN
+    // test is made on the bits (`lower.rs`, `is_nan_f32`), which fast-math
+    // operands cannot fold away; they stay for the bitcode's own folds.
+    #![allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -227,6 +264,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Written without the fast-math flags whatever [`opt::FAST`] says: a program whose
+    /// float results must be the console's bit for bit (the ordered paired FP32
+    /// reductions), while the others keep the flags.
+    pub exact_floats: bool,
 }
 
 impl Module {
@@ -826,6 +867,9 @@ impl Module {
         }
         w.exit();
 
+        // Not in unit tests: their expected bitcode is the plain one.
+        let fast = !cfg!(test) && !self.exact_floats && super::shader_opt() & opt::FAST != 0;
+        let fast_bits = fast_math_bits();
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
@@ -840,6 +884,11 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    // A 32-bit float result takes the unsafe-algebra flag
+                    // (bit 0 of the optional fourth field) with `opt::FAST`.
+                    Op::Bin(op, a, b) if fast && fast_bits != 0 && self.types[inst.ty.0 as usize] == TypeDef::Float => {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, fast_bits])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
