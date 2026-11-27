@@ -1215,15 +1215,23 @@ fn create() -> windows::core::Result<Host> {
     crate::renderdoc::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
+        // The runtime the devices come from: the Agility SDK when one is
+        // found (Windows 10's own stops at Shader Model 6.5), else the
+        // inbox one (`victory_shader::agility`).
+        tracing::info!(runtime = %victory_shader::agility::describe(), "host D3D12 runtime");
         // The debug layer only in builds with diagnostics.
         let debug =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
         if debug {
-            let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
-            }
+            let layer: Option<ID3D12Debug> =
+                match victory_shader::agility::configuration(&CLSID_D3D12Debug) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no D3D12 debug layer");
+                        None
+                    }
+                };
+            layer.iter().for_each(|l| l.EnableDebugLayer());
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
@@ -1246,9 +1254,9 @@ fn create() -> windows::core::Result<Host> {
         // faulting address), read when the device is removed.
         if dred_any() {
             let mode = dred_mode();
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
+            if let Ok(dred) = victory_shader::agility::configuration::<
+                ID3D12DeviceRemovedExtendedDataSettings,
+            >(&CLSID_D3D12DeviceRemovedExtendedData)
             {
                 // `faults`: no breadcrumbs (the runtime then adds nothing
                 // to the commands), only the faulting address.
@@ -1264,18 +1272,20 @@ fn create() -> windows::core::Result<Host> {
                 );
             }
         }
-        let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let device = if cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+        {
+            let adapter: windows::core::IUnknown = warp_adapter()?.cast()?;
+            let device =
+                victory_shader::agility::create_device(Some(&adapter), D3D_FEATURE_LEVEL_12_0)?;
             tracing::info!("host device on the software adapter (WARP)");
+            device
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+            victory_shader::agility::create_device(None, D3D_FEATURE_LEVEL_12_0)?
+        };
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.

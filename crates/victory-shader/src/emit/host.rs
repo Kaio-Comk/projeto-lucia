@@ -70,39 +70,39 @@ impl Host {
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
             // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
-                let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
-                    && let Some(debug) = debug
-                {
-                    debug.EnableDebugLayer();
-                }
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+                && let Ok(debug) =
+                    crate::agility::configuration::<ID3D12Debug>(&CLSID_D3D12Debug)
+            {
+                debug.EnableDebugLayer();
             }
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
+            // Devices come from the Agility SDK when one is found: Windows
+            // 10's own runtime stops at Shader Model 6.5 (`crate::agility`).
+            let device = if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let adapter: windows::core::IUnknown = adapter.cast().map_err(err)?;
+                crate::agility::create_device(Some(&adapter), D3D_FEATURE_LEVEL_12_0)
+                    .map_err(err)?
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let made =
+                    crate::agility::create_device(None, D3D_FEATURE_LEVEL_12_0).map_err(err)?;
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
                 // device): that is no hardware device, and the tests that
                 // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                    {
-                        return Err("the default device is the software adapter".to_owned());
-                    }
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                    && let Ok(desc) = adapter.GetDesc1()
+                    && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                {
+                    return Err("the default device is the software adapter".to_owned());
                 }
-            }
-            let device = device.ok_or("no device")?;
+                made
+            };
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -115,8 +115,10 @@ impl Host {
                 .map_err(err)?;
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
+                    "the device supports SM {:#x} only, through the {}; on Windows 10 put the Agility SDK's D3D12Core.dll in <exe>\\D3D12 or set {}",
+                    sm.HighestShaderModel.0,
+                    crate::agility::describe(),
+                    crate::agility::ENV
                 ));
             }
             Ok(Host { device })
@@ -224,8 +226,13 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            crate::agility::serialize_root_signature(
+                Some(&self.device),
+                &desc,
+                &mut blob,
+                Some(&mut error),
+            )
+            .map_err(err)?;
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),
