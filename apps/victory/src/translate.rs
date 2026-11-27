@@ -203,8 +203,13 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash.clone()) {
                                 continue;
+                            }
+                            // A list of hashes: each found one by its hash and where it
+                            // comes from (its program's name), to tell them apart in a run.
+                            if !all {
+                                println!("warm-up      found {hash} {}", job.label());
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
