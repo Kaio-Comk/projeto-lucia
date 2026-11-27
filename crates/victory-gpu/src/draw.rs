@@ -3208,15 +3208,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
-            // Not all of it there: looked at again next frame, and from
-            // then on as a slot with nothing new (a placed texture: until
-            // more of it is mapped; a texture object at an address the
-            // title mapped: again in 120 frames, as before).
-            let again = match partly {
-                Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
-            };
+            let (bytes, again) = crate::texture::staged_revisit(resource, frame, partly);
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
             }
