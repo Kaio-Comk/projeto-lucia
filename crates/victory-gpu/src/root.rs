@@ -102,6 +102,20 @@ pub extern "system" fn serialize(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    // A 1.0 serialization is the versioned one with version 1.0.
+    #[cfg(windows)]
+    if version == 1
+        && let Some(hr) = agility_serialize(
+            &VersionedDesc {
+                version,
+                desc: without_console_flags(desc),
+            },
+            blob,
+            error,
+        )
+    {
+        return hr;
+    }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
@@ -128,17 +142,49 @@ pub extern "system" fn serialize_versioned(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let desc = VersionedDesc {
+        desc: without_console_flags(desc.desc),
+        ..desc
+    };
+    #[cfg(windows)]
+    if let Some(hr) = agility_serialize(&desc, blob, error) {
+        return hr;
+    }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
-    let desc = VersionedDesc {
-        desc: without_console_flags(desc.desc),
-        ..desc
-    };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+}
+
+/// With the Agility SDK loaded, the host device's own runtime serializes:
+/// the inbox export refuses the Shader Model 6.6 flags on Windows 10
+/// (`victory_shader::agility`). `None`: no Agility SDK or no host device,
+/// so the inbox export does it, as before.
+#[cfg(windows)]
+fn agility_serialize(
+    desc: &VersionedDesc,
+    blob: *mut *mut c_void,
+    error: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if !victory_shader::agility::loaded() {
+        return None;
+    }
+    let host = crate::host::host()?;
+    // SAFETY: `VersionedDesc` is laid out as the PC versioned description
+    // (the version, then the description at offset 8); the out slots are the
+    // title's, a null error slot passed as none.
+    let result = unsafe {
+        victory_shader::agility::serialize_root_signature(
+            Some(&host.device),
+            std::ptr::from_ref(desc).cast(),
+            blob.cast(),
+            (!error.is_null()).then_some(error.cast()),
+        )
+    };
+    Some(result.map_or_else(|e| e.code().0, |()| object::S_OK))
 }
 
 type Deserialize =
