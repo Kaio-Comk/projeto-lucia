@@ -11,7 +11,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
-const MAX_RUST_SOURCE_SIZE: usize = 1024 * 1024;
+/// Upstream files (`fxceless/victory-fork` commit `52ac4ec`) that already exceeded
+/// `MAX_FILE_SIZE` before Projeto Lucia branched. Exempted only from the byte ceiling
+/// (still checked for forbidden magic, NUL bytes, and long encoded runs).
+const UPSTREAM_LARGE_SOURCE_LIMIT: usize = 1024 * 1024;
+const UPSTREAM_LARGE_SOURCES: &[&str] = &[
+    "crates/victory-gpu/src/host.rs",
+    "crates/victory-shader/src/emit/lower.rs",
+];
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -203,8 +210,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    let max_size = if ext.as_deref() == Some("rs") {
-        MAX_RUST_SOURCE_SIZE
+    let max_size = if UPSTREAM_LARGE_SOURCES.contains(&path) {
+        UPSTREAM_LARGE_SOURCE_LIMIT
     } else {
         MAX_FILE_SIZE
     };
