@@ -20,6 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+/// Packed dot-product lowering (`v_dot*`), a child module so it shares the
+/// emitter's state without growing this file.
+#[path = "dot.rs"]
+mod dot;
+
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
@@ -7124,6 +7129,9 @@ impl<'a> Lower<'a> {
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
+        if name.starts_with("v_dot") {
+            return self.dot_product(inst, name, guard);
+        }
         match name {
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
@@ -12378,5 +12386,67 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// `v_dot8_i32_i4` and `v_dot4_i32_i8`/`v_dot4_u32_u8` decode and translate
+    /// (clamped and unclamped) in a program storing their results.
+    #[test]
+    fn signed_nibble_dot_product_translates() {
+        let enc = |op: u32, clamp: u32| {
+            [
+                0xCC00_4000 | (op << 16) | (clamp << 15),
+                0x101 | 0x102 << 9 | 0x103 << 18 | 3 << 27,
+            ]
+        };
+        let program = |body: [u32; 2]| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+            ];
+            // v_mov_b32 v1..v4, s0..s3
+            words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+            words.extend(body);
+            words.extend([0xE070_0000, 0x8002_0000, S_ENDPGM]); // buffer_store_dword v0
+            words
+        };
+        let code: Vec<u8> = program(enc(0x18, 0))
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let names: Vec<_> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.name())
+            .collect();
+        assert!(names.contains(&Some("v_dot8_i32_i4")), "{names:?}");
+        let buffer = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let constants = RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        };
+        for (op, label) in [
+            (0x16, "v_dot4_i32_i8"),
+            (0x17, "v_dot4_u32_u8"),
+            (0x18, "v_dot8_i32_i4"),
+        ] {
+            for clamp in [0, 1] {
+                lower_with(
+                    &program(enc(op, clamp)),
+                    vec![constants, root(RootType::Table, 4, 1)],
+                    vec![buffer],
+                )
+                .unwrap_or_else(|e| panic!("{label} clamp {clamp}: {e}"));
+            }
+        }
     }
 }
