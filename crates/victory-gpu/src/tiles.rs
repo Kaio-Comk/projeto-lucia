@@ -165,6 +165,19 @@ struct Heap {
 unsafe impl Send for Heap {}
 
 impl Heap {
+    /// Opening title pages gives a custom L0 heap; sending a non-DEFAULT heap
+    /// to `UpdateTileMappings` removes the device. Reject it before pooling.
+    fn admit(heap: ID3D12Heap) -> Option<Self> {
+        // SAFETY: the caller holds a live heap.
+        if unsafe { heap.GetDesc().Properties.Type } != D3D12_HEAP_TYPE_DEFAULT {
+            return None;
+        }
+        Some(Self {
+            heap,
+            free: vec![(0, HEAP_TILES)],
+        })
+    }
+
     fn free_tiles(&self) -> u32 {
         self.free.iter().map(|run| run.1).sum()
     }
@@ -173,6 +186,12 @@ impl Heap {
 /// The pool's heaps by place; a place is empty after its heap went back to
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn rejects_test_heap(heap: ID3D12Heap) -> bool {
+    Heap::admit(heap).is_none()
+}
 
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
@@ -202,10 +221,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
-            let fresh = Heap {
-                heap: made?,
-                free: vec![(0, HEAP_TILES)],
-            };
+            let fresh = Heap::admit(made?)?;
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
